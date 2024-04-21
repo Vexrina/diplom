@@ -6,15 +6,17 @@ package main
 import "C"
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
-	
-	"encoding/json"
 	"net/http"
+	"os"
+	"os/exec"
 	"strconv"
+	"strings"
 )
 
-func callTtoI(prompt string) (string){
+func callTtoI(prompt string) string {
 	C.initializePython()
 	defer C.finalizePython()
 	pythonCode := fmt.Sprintf(`
@@ -31,7 +33,7 @@ print("Success")
 	return C.GoString(C.callPythonCode(C.CString(pythonCode)))
 }
 
-func callTtoV(prompt string) (string){
+func callTtoV(prompt string) string {
 	C.initializePython()
 	defer C.finalizePython()
 	pythonCode := fmt.Sprintf(`
@@ -69,12 +71,12 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	}
 	output := ""
 	if video {
-		output=callTtoV(prompt)
+		output = callTtoV(prompt)
 	} else {
-		output=callTtoI(prompt)
+		output = callTtoI(prompt)
 	}
 
-	jsonMessage, err:= json.Marshal(output)
+	jsonMessage, err := json.Marshal(output)
 	if err != nil {
 		log.Printf("Error encoding message to json: %v", err)
 		return
@@ -85,10 +87,41 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	w.Write(jsonMessage)
 }
 
+func loadHandler(w http.ResponseWriter, _ *http.Request) {
+	pid := os.Getpid()
+
+	out, err := exec.Command("nvidia-smi", "--query-compute-apps=pid,utilization.gpu", "--format=csv,noheader,nounits").Output()
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to execute nvidia-smi: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	lines := strings.Split(string(out), "\n")
+	for _, line := range lines {
+		fields := strings.Split(line, ",")
+		if len(fields) >= 2 && fields[0] == strconv.Itoa(pid) {
+			gpuUtilization := strings.TrimSpace(fields[1])
+
+			gpuUtilizationPercent, err := strconv.ParseFloat(gpuUtilization, 64)
+			if err != nil {
+				http.Error(w, fmt.Sprintf("Failed to parse GPU utilization: %v", err), http.StatusInternalServerError)
+				return
+			}
+
+			gpuUtilizationDecimal := gpuUtilizationPercent / 100.0
+
+			fmt.Fprintf(w, "Server: 8082, GPUload: %.4f\n", gpuUtilizationDecimal)
+			return
+		}
+	}
+	fmt.Fprintf(w, "Server: 8082, GPUload: 0.00\n")
+}
+
 func main() {
 	port := ":8082"
-	
+
 	http.HandleFunc("/", handler)
+	http.HandleFunc("/load", loadHandler)
 
 	log.Printf("Сервер запущен на порту %s\n", port)
 	log.Fatal(http.ListenAndServe(port, nil))
