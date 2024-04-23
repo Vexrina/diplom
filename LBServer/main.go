@@ -2,15 +2,12 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"time"
-
-	"github.com/segmentio/kafka-go"
 )
 
 type EnvironmentMessage struct {
@@ -18,6 +15,11 @@ type EnvironmentMessage struct {
 	RequestQueueLength int         `json:"request_queue_length"`
 	ResponseTime       float64     `json:"response_time"`
 	RequestBody        RequestBody `json:"request_body"`
+}
+
+type RewardMessage struct{
+	Reward float64 `json:"reward"`
+    Environment EnvironmentMessage `json:"environment"`
 }
 
 type RequestBody struct {
@@ -42,13 +44,10 @@ var responseTime []float64
 
 var rlResponses = make(chan string)
 
-// Функция отправки сообщения в кафку
+/*
+Функция для отправки среды и промпта в RL модельку.
+*/
 func sendEnvironment(request Request) {
-	writer := kafka.NewWriter(kafka.WriterConfig{
-		Brokers: []string{"localhost:9092"},
-		Topic:   "environment_topic",
-	})
-
 	envMessage := getEnvironmentState(request)
 
 	jsonMessage, err := json.Marshal(envMessage)
@@ -57,41 +56,40 @@ func sendEnvironment(request Request) {
 		return
 	}
 
-	err = writer.WriteMessages(context.Background(), kafka.Message{
-		Key:   []byte(""),
-		Value: jsonMessage,
-	})
+	rlResponse, err := sendPostRequest("0.0.0.0:7999/predict_server", jsonMessage)
 	if err != nil {
-		log.Printf("Error send message to Kafka: %v", err)
+		log.Printf("Error encoding message to json: %v", err)
 		return
 	}
 
-	writer.Close()
+	rlResponses <- string(rlResponse)
 }
 
-func readRLResponse() {
-	reader := kafka.NewReader(kafka.ReaderConfig{
-		Brokers:   []string{"localhost:9092"},
-		Topic:     "rl_response",
-		Partition: 0,
-		MinBytes:  10e3, // 10KB
-		MaxBytes:  10e6, // 10MB
-	})
+/*
+Функция для отправки награды и среды в RL модельку.
+*/
+func sendReward(reward float64, request Request) {
+	envMessage := getEnvironmentState(request)
 
-	defer reader.Close()
+	jsonMessage, err := json.Marshal(RewardMessage{reward, envMessage})
+	if err != nil {
+		log.Printf("Error encoding message to json: %v", err)
+		return
+	}
 
-	for {
-		msg, err := reader.ReadMessage(context.Background())
-		if err != nil {
-			log.Printf("Error reading message from Kafka: %v", err)
-			continue
-		}
-
-		message := string(msg.Value)
-		rlResponses <- message
+	_, err = sendPostRequest("0.0.0.0:7999/get_reward", jsonMessage)
+	if err != nil {
+		log.Printf("Error encoding message to json: %v", err)
+		return
 	}
 }
 
+/*
+# TODO: посмотреть, есть ли внутренняя функция для этого.
+
+Функция-утилита для подсчета среднего. Используется только
+для подсчета среднего по времени ответа.
+*/
 func average(slice []float64) float64 {
 	sum := 0.0
 	for _, num := range slice {
@@ -100,6 +98,10 @@ func average(slice []float64) float64 {
 	return sum / float64(len(slice))
 }
 
+/*
+Функция утилита для посыла гетзапросов на взятие нагрузки на сервера.
+Ходит на пришедший url, считывает данные, возвращает
+*/
 func sendGetRequest(url string) ([]byte, error) {
 	resp, err := http.Get(url)
 	if err != nil {
@@ -115,6 +117,14 @@ func sendGetRequest(url string) ([]byte, error) {
 	return body, nil
 }
 
+/*
+Функция-забиратель нагрузки на серверы.
+Ходит по внешним серверам(в рамках ВКР рассматриваются исключительно localhost:808(1,2,3),
+но в теории можно ее масштабировать достаточно просто).
+Заполняет нагрузку на сервера в слайс, высчитывает среднее время отклика и считает текущую
+заполненность очереди.
+Возвращает EnvironmentMessage.
+*/
 func getEnvironmentState(request Request) EnvironmentMessage {
 	serverURL := "localhost:"
 	ports := []string{"8081", "8082", "8083"}
@@ -141,7 +151,11 @@ func getEnvironmentState(request Request) EnvironmentMessage {
 	return EnvironmentMessage{serverLoads, requestQueueLength, meanResponseTime, request.Body}
 }
 
-// Функция отправки запроса на сервер
+/*
+Функция POST запроса по юрлу.
+Отправляет запрос и ждет ответа.
+Возвращает, логично, ответ.
+*/
 func sendPostRequest(url string, requestBody []byte) ([]byte, error) {
 	resp, err := http.Post(url, "application/json", bytes.NewBuffer(requestBody))
 	if err != nil {
@@ -157,7 +171,20 @@ func sendPostRequest(url string, requestBody []byte) ([]byte, error) {
 	return body, nil
 }
 
-// Обработчик запросов
+/*
+# Обработчик запросов.
+
+Является основным эндпоинтом проекта, т.к. через него происходит общение всего со всем,
+т.е. в контексте облачных вычислений является сервером посредником между клиентом и
+системой облачных комьютеров.
+
+При появлении запроса расшифровывает его в RequestBody, после чего добавляет его в очередь запросов.
+Если очередь переполнена -> http.StatusServiceUnavailable
+
+Разбирает очередь - worker.
+
+Как только получен ответ, возвращает его пользователю.
+*/
 func handler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Метод запроса должен быть POST", http.StatusMethodNotAllowed)
@@ -200,8 +227,18 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	w.Write(resp.Body)
 }
 
+/*
+Используем воркера, который при появлении запроса будет запускать логику его обработки.
+Он будет засекать время начала обработки, ходить в нейронку со средой и запросом,
+принимать выход нейронки. После чего отсылать запрос на нужный сервер и отправлять награду
+и новую среду нейронке для обновления весов.
+Когда запрос будет обработан вернет его клиенту.
+
+Запускать как горутину.
+*/
 func worker() {
 	for req := range requestQueue {
+		reward:=0.0
 		start := time.Now()
 		sendEnvironment(req)
 		rlResponse := <-rlResponses
@@ -209,16 +246,29 @@ func worker() {
 		// Определяем сервер для перенаправления запроса на основе ответа от RL нейронной сети
 		serverToRedirect := rlResponse
 
+		if req.Body.Video{
+			if serverToRedirect=="server3"{
+				reward-=1
+			} else {
+				reward += 0.5
+			}
+		} else {
+			if serverToRedirect=="server1"{
+				reward-=1
+			} else {
+				reward += 0.5
+			}
+		}
 		// Определяем URL сервера на основе ответа от RL нейронной сети
 		serverURL := "localhost:"
 		port := "null"
 		switch serverToRedirect {
 		case "server1":
-			port = "8081"
+			port = "8081" // ToVideo
 		case "server2":
-			port = "8082"
+			port = "8082" // ToBoth
 		case "server3":
-			port = "8083"
+			port = "8083" // ToImage
 		default:
 			req.Resp <- Response{Err: fmt.Errorf("недопустимый сервер")}
 			continue
@@ -241,12 +291,12 @@ func worker() {
 		// Отправляем ответ в канал
 		req.Resp <- Response{Body: responseBody}
 		responseTime = append(responseTime, float64(time.Since(start)))
+		sendReward(reward, req)
 	}
 }
 
 func main() {
 	go worker()
-	go readRLResponse()
 
 	port := ":8080"
 
