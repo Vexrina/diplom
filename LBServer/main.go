@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"time"
 )
@@ -17,9 +18,9 @@ type EnvironmentMessage struct {
 	RequestBody        RequestBody `json:"request_body"`
 }
 
-type RewardMessage struct{
-	Reward float64 `json:"reward"`
-    Environment EnvironmentMessage `json:"environment"`
+type RewardMessage struct {
+	Reward      float64            `json:"reward"`
+	Environment EnvironmentMessage `json:"environment"`
 }
 
 type RequestBody struct {
@@ -44,6 +45,11 @@ var responseTime []float64
 
 var rlResponses = make(chan string)
 
+var timeThreshold float64 = 4 * 60
+var timeBonus = 1.75
+
+var serverEfficiencyBonus = 1.25
+
 /*
 Функция для отправки среды и промпта в RL модельку.
 */
@@ -65,11 +71,60 @@ func sendEnvironment(request Request) {
 	rlResponses <- string(rlResponse)
 }
 
+func calculateServerEfficiency(env EnvironmentMessage) float64 {
+	totalServerLoads := 0.0
+	numServers := len(env.ServerLoads)
+
+	// Суммируем загрузку GPU для всех серверов
+	for _, load := range env.ServerLoads {
+		totalServerLoads += load
+	}
+
+	// Вычисляем среднюю загрузку GPU
+	averageServerLoad := totalServerLoads / float64(numServers)
+
+	// Вычисляем показатель эффективности на основе нормализованной загрузки GPU
+	serverEfficiency := 1 - averageServerLoad
+
+	return math.Max(serverEfficiency, 0) // Убедимся, что значение находится в диапазоне от 0 до 1
+}
+
+func calculateReward(serverToRedirect string, req Request, responseTime float64) float64 {
+	reward := 0.0
+
+	// Определение награды на основе ответа RL нейронной сети и других параметров запроса
+	if req.Body.Video {
+		switch serverToRedirect {
+		case "server3":
+			reward -= 1
+		default:
+			reward += 0.5
+		}
+	} else {
+		switch serverToRedirect {
+		case "server1":
+			reward -= 1
+		default:
+			reward += 0.5
+		}
+	}
+
+	// Бонус за меньшее время ожидания ответа клиента
+	if responseTime < timeThreshold {
+		reward += timeBonus
+	}
+
+	return reward
+}
+
 /*
 Функция для отправки награды и среды в RL модельку.
 */
 func sendReward(reward float64, request Request) {
 	envMessage := getEnvironmentState(request)
+	serverEfficiency := calculateServerEfficiency(envMessage)
+
+	reward += serverEfficiencyBonus * serverEfficiency
 
 	jsonMessage, err := json.Marshal(RewardMessage{reward, envMessage})
 	if err != nil {
@@ -238,7 +293,6 @@ func handler(w http.ResponseWriter, r *http.Request) {
 */
 func worker() {
 	for req := range requestQueue {
-		reward:=0.0
 		start := time.Now()
 		sendEnvironment(req)
 		rlResponse := <-rlResponses
@@ -246,19 +300,6 @@ func worker() {
 		// Определяем сервер для перенаправления запроса на основе ответа от RL нейронной сети
 		serverToRedirect := rlResponse
 
-		if req.Body.Video{
-			if serverToRedirect=="server3"{
-				reward-=1
-			} else {
-				reward += 0.5
-			}
-		} else {
-			if serverToRedirect=="server1"{
-				reward-=1
-			} else {
-				reward += 0.5
-			}
-		}
 		// Определяем URL сервера на основе ответа от RL нейронной сети
 		serverURL := "localhost:"
 		port := "null"
@@ -290,7 +331,9 @@ func worker() {
 
 		// Отправляем ответ в канал
 		req.Resp <- Response{Body: responseBody}
-		responseTime = append(responseTime, float64(time.Since(start)))
+		lastResponseTime := time.Since(start)
+		responseTime = append(responseTime, float64(lastResponseTime))
+		reward := calculateReward(serverToRedirect, req, float64(lastResponseTime))
 		sendReward(reward, req)
 	}
 }

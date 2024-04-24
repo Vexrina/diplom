@@ -9,6 +9,7 @@ import uvicorn
 
 app = FastAPI()
 latest_action = None
+episode = 0
 
 
 class RLModel(nn.Module):
@@ -44,17 +45,20 @@ class CustomCallback:
         self.model = model
         self.losses = []
         self.rewards = []
+        self.episode = 0
 
-    def on_episode_end(self, episode):
+    def on_episode_end(self):
         torch.save(self.model.state_dict(), f'model_weights_{episode}.pt')
-        with open(f'episode_{episode}_data.csv', mode='w') as csv_file:
-            fieldnames = ['loss', 'reward']
+        with open('model_data.csv', mode='w') as csv_file:
+            self.episode = 0
+            fieldnames = ['episode', 'loss', 'reward']
             writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
             writer.writeheader()
             for loss, reward in zip(self.losses, self.rewards):
-                writer.writerow({'loss': loss, 'reward': reward})
-        self.losses = []
-        self.rewards = []
+                self.episode += 1
+                writer.writerow(
+                    {'episode': episode, 'loss': loss, 'reward': reward}
+                )
 
     def on_loss_calculated(self, loss):
         self.losses.append(loss.item())
@@ -174,6 +178,7 @@ def update_model(reward: RewardRequest):
     for callback in callbacks:
         callback.on_loss_calculated(loss)
         callback.on_reward_received(reward)
+        callback.on_episode_end()
 
     loss.backward()
     optimizer.step()
