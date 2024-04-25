@@ -1,13 +1,9 @@
 import torch
 import torch.nn as nn
-import torch.optim as optim
 import numpy as np
 import csv
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-import uvicorn
 
-app = FastAPI()
+
 latest_action = None
 episode = 0
 
@@ -67,46 +63,7 @@ class CustomCallback:
         self.rewards.append(reward)
 
 
-#  block with constants
-input_size = 7  # 7 параметров входных данных
-output_size = 3  # 3 параметра выходных данных
-learning_rate = 1e-3
-num_episodes = 1000
-gamma = 0.9
-
-# create device
-device = "cuda:0" if torch.cuda.is_available() else "cpu"
-
-# create a model, criterion, optimizer, callbacks
-model = RLModel(
-    input_size=input_size,
-    output_size=output_size,
-).to_device(device)
-criterion = nn.MSELoss()
-optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-callback = CustomCallback(model)
-
-callbacks = [callback]
-
-
-class RequestBody(BaseModel):
-    prompt: str
-    video: bool
-
-
-class Data(BaseModel):
-    server_loads: list[float]
-    request_queue_length: float
-    response_time: float
-    request_body: RequestBody
-
-
-class RewardRequest(BaseModel):
-    reward: float
-    environment: Data
-
-
-def process_data(data: Data) -> dict:
+def process_data(data: dict) -> dict:
     """Предобработка данных, полученных от Golang серверов.
     Данные приходят в "грязном" формате, т.е. имеются вложенные словари.
     В данной функции они "очищаются", т.е. мы их разкручиваем до тех пор, пока
@@ -138,7 +95,7 @@ def select_action(state, model):
     return action
 
 
-def choose_server(server_data: Data):
+def choose_server(server_data: dict, model: RLModel):
     processed_data = process_data(server_data)
     action = select_action(
             processed_data,
@@ -147,18 +104,16 @@ def choose_server(server_data: Data):
     return action
 
 
-@app.post("/predict_server")
-def predict_server(server_data: Data):
-    try:
-        server_id = choose_server(server_data=server_data)
-        return {"server": f"server{server_id}"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-def update_model(reward: RewardRequest):
-    data = process_data(RewardRequest.environment)
-    reward_value = reward.reward
+def update_model(
+    reward: dict,
+    model: RLModel,
+    gamma: float,
+    criterion,  # MSELoss
+    callbacks,  # [CustomCallback, etc.]
+    optimizer,  # nn.Optimizer
+):
+    data = process_data(reward['environment'])
+    reward_value = reward['reward']
     with torch.no_grad():
         target = reward_value + gamma * torch.max(
             model(
@@ -183,16 +138,3 @@ def update_model(reward: RewardRequest):
     loss.backward()
     optimizer.step()
     optimizer.zero_grad()
-
-
-@app.post("/get_reward")
-def get_reward(reward: RewardRequest):
-    try:
-        update_model(reward)
-        return {"sucess": "success"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=(str(e)))
-
-
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=7999)
