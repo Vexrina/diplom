@@ -1,5 +1,6 @@
 import asyncio
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, HTTPException
 import httpx
 import numpy as np
@@ -7,17 +8,18 @@ import time
 import torch
 import torch.nn as nn
 from torch import optim
+import uvicorn
 import lbmodel
 
 
 app = FastAPI()
 
 #  block with constants
-IN_SIZE = 7  # 7 параметров входных данных
+IN_SIZE = 6  # 7 параметров входных данных
 OUT_SIZE = 3  # 3 параметра выходных данных
 LR = 1e-3
 num_episodes = 1000
-GAMMA = 0.9
+GAMMA = torch.tensor(0.9)
 # For dont use very much GPUspace
 MAX_REQUESTS_PER_SERVER = 5
 requests_per_server = {0: 0, 1: 0, 2: 0}
@@ -29,7 +31,7 @@ device = "cuda:0" if torch.cuda.is_available() else "cpu"
 model = lbmodel.RLModel(
     input_size=IN_SIZE,
     output_size=OUT_SIZE,
-).to_device(device)
+).to(device)
 
 criterion = nn.MSELoss()
 optimizer = optim.Adam(model.parameters(), lr=LR)
@@ -39,6 +41,7 @@ callbacks = [callback]
 
 max_len_queue = 50
 request_queue = deque()
+request_events = {}
 responses = {}
 
 response_time = np.array([])
@@ -75,7 +78,7 @@ localhost:808(1,2,3), но в теории можно ее масштабиро�
         video              bool
     """
     server_urls = [
-        "http://localhost:8081/load",
+        "http://localhost:8084/load",
         "http://localhost:8082/load",
         "http://localhost:8083/load",
     ]
@@ -84,11 +87,11 @@ localhost:808(1,2,3), но в теории можно ее масштабиро�
     for url in server_urls:
         try:
             response = httpx.get(url)
-            server_loads.append(float(response['GPUload']))
+            server_loads.append(float(response.json()['GPUload']))
         except Exception as e:
             print(f"Error getting server load from {url}: {e}")
 
-    mrt = sum(response_time) / len(response_time) if response_time else 0
+    mrt = np.mean(response_time) if response_time.size > 0 else 0
     request_queue_length = len(request_queue) / max_len_queue
 
     return {
@@ -100,14 +103,21 @@ localhost:808(1,2,3), но в теории можно ее масштабиро�
     }
 
 
-def send_reward(reward: float, request: dict):
+def send_reward(request: dict, server_to_redirect: int, timer: float):
     """Отправляет награду в модельку
 
     Args:
-        reward (float): подсчитанная награда
         request (dict): изначальный запрос пользователя
+        server_to_redirect (int): сервер, на который перенаправили запрос
+        timer (float): время ответа от сервера.
     """
     environment = get_environment_state(request)
+    reward = calculate_reward(
+        request,
+        server_to_redirect,
+        environment['server_loads'],
+        timer,
+    )
     lbmodel.update_model(
         reward={
             "reward": reward,
@@ -118,6 +128,7 @@ def send_reward(reward: float, request: dict):
         criterion=criterion,
         callbacks=callbacks,
         optimizer=optimizer,
+        device=device,
     )
 
 
@@ -125,6 +136,7 @@ def calculate_reward(
     req: dict,
     server_to_redirect: int,
     server_loads: list[float],
+    timer: float,
 ) -> float:
     """Подсчитывает награду для модели.
 
@@ -132,6 +144,7 @@ def calculate_reward(
         req (dict): запрос пользователя
         server_to_redirect (int): на какой сервер послали запрос
         server_loads (list[float]): нагрузка на сервера
+        timer (float): время ответа от сервера
 
     Returns:
         float: награда
@@ -151,7 +164,7 @@ def calculate_reward(
             reward += 0.5
 
     # ответ от сервера уже не актуален
-    if response_time < time_threshold:
+    if timer < time_threshold:
         reward += time_bonus
 
     # эффективное использование серверов
@@ -187,9 +200,16 @@ async def main_job(request_body: dict):
             status_code=500,
             detail="Request queue is full",
         )
+
+    event = asyncio.Event()
+    request_events[id(request_body)] = event
     request_queue.append(request_body)
-    response = await request_body[request_body]
-    return response
+
+    await event.wait()
+    del request_events[id(request_body)]
+    
+    response = responses[request_body['prompt']]
+    return response.json()
 
 
 async def worker():
@@ -205,16 +225,19 @@ async def worker():
 В Golang запускается как корутина
     """
     server_url = "http://localhost:"
+    print("Worker started")
     while True:
         if request_queue:
+            print("get request")
             req = request_queue.popleft()
+            event = request_events.get(id(req))
             start = time.time()
             env = get_environment_state(req)
-            server_redirect = lbmodel.choose_server(env, model)
-
+            server_redirect = lbmodel.choose_server(env, model, device)
+            print("get redirect server")
             match server_redirect:
                 case 0:
-                    port = "8081"
+                    port = "8084"
                 case 1:
                     port = "8082"
                 case 2:
@@ -227,7 +250,9 @@ async def worker():
                 resp = {
                     "error": err,
                 }
-                responses[req] = resp
+                responses[req['prompt']] = resp
+                if event:
+                    event.set()
                 end = time.time()-start
                 np.append(response_time, end)
                 reward = calculate_reward(
@@ -236,17 +261,37 @@ async def worker():
                 send_reward(reward-2, req)
             else:
                 requests_per_server[server_redirect] += 1
-                resp = await httpx.post(
-                    url=server_url+port,
-                    data=req
-                )
-                responses[req] = resp
+                print("wait answer from server:", port)
+                async with httpx.AsyncClient() as client:
+                    resp = await client.post(
+                        url=server_url + port,
+                        json=req,
+                        timeout=3*60
+                    )
+                responses[req['prompt']] = resp
+                if event:
+                    event.set()
                 end = time.time()-start
                 np.append(response_time, end)
-                reward = calculate_reward(
-                    req, server_redirect
-                )
+                print("send reward")
                 requests_per_server[server_redirect] -= 1
-                send_reward(reward, req)
+                send_reward(req, server_redirect, end)
         else:
-            await asyncio.sleep(0.1)
+            print("dont get request")
+            await asyncio.sleep(0.5)
+
+
+async def main():
+    # Запуск сервера uvicorn без использования uvicorn.run()
+    config = uvicorn.Config(app, host="0.0.0.0", port=8080)
+    server = uvicorn.Server(config)
+    await server.serve()
+
+if __name__ == "__main__":
+    loop = asyncio.get_event_loop()
+    executor = ThreadPoolExecutor(max_workers=2)  # Запускаем в двух потоках
+    tasks = [
+        loop.create_task(main()),
+        loop.create_task(worker()),
+    ]
+    loop.run_until_complete(asyncio.gather(*tasks))

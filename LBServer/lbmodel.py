@@ -60,7 +60,7 @@ class CustomCallback:
         self.losses.append(loss.item())
 
     def on_reward_received(self, reward):
-        self.rewards.append(reward)
+        self.rewards.append(reward.item())
 
 
 def process_data(data: dict) -> dict:
@@ -73,33 +73,34 @@ def process_data(data: dict) -> dict:
         data (dict): набор всех данных в "грязном" формате.
 
     Returns:
-        processed_data (dict): чистый набор данных
+        processed_data (list): чистый набор данных
     """
     processed_data = {
         'server1_loads': data['server_loads'][0],
         'server2_loads': data['server_loads'][1],
         'server3_loads': data['server_loads'][2],
-        'request_queue_length': data['request_queue_length'],
-        'response_time': data['response_time'],
-        'prompt': data['request_body']['prompt'],
-        'video': data['request_body']['video'],
+        'request_queue_length': data['queue_len'],
+        'response_time': data['mrt'],
+        # 'prompt': data['request_body']['prompt'],
+        'video': 1 if data['video'] else 0,
     }
-    return processed_data
+    return list(processed_data.values())
 
 
-def select_action(state, model):
+def select_action(state, model, device):
     state_tensor = torch.tensor(state, dtype=torch.float32)
     with torch.no_grad():
-        action_values = model(state_tensor)
-    action = np.argmax(action_values.numpy())
+        action_values = model(state_tensor.to(device))
+    action = np.argmax(action_values.cpu().numpy())
     return action
 
 
-def choose_server(server_data: dict, model: RLModel):
+def choose_server(server_data: dict, model: RLModel, device: str):
     processed_data = process_data(server_data)
     action = select_action(
             processed_data,
             model,
+            device,
         )
     return action
 
@@ -107,23 +108,27 @@ def choose_server(server_data: dict, model: RLModel):
 def update_model(
     reward: dict,
     model: RLModel,
-    gamma: float,
-    criterion,  # MSELoss
-    callbacks,  # [CustomCallback, etc.]
-    optimizer,  # nn.Optimizer
+    gamma: torch.Tensor,
+    criterion,    # MSELoss
+    callbacks,    # [CustomCallback, etc.]
+    optimizer,    # nn.Optimizer
+    device: str,  # cuda or cpu
 ):
     data = process_data(reward['environment'])
-    reward_value = reward['reward']
+    reward_value = torch.tensor(
+        reward['reward'],
+        dtype=torch.float32,
+    ).to(device)
     with torch.no_grad():
-        target = reward_value + gamma * torch.max(
+        target = reward_value + gamma.to(device) * torch.max(
             model(
                 torch.tensor(
                     data,
                     dtype=torch.float32
-                )
+                ).to(device)
             )
         )
-    current_prediction = model(torch.tensor(data, dtype=torch.float32))
+    current_prediction = model(torch.tensor(data, dtype=torch.float32).to(device))
     current_prediction_for_action = current_prediction[latest_action]
 
     # Считаем ошибку
@@ -132,7 +137,7 @@ def update_model(
     # отдаем это в коллбэки
     for callback in callbacks:
         callback.on_loss_calculated(loss)
-        callback.on_reward_received(reward)
+        callback.on_reward_received(reward_value)
         callback.on_episode_end()
 
     loss.backward()

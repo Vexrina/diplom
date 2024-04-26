@@ -1,7 +1,6 @@
 from fastapi import FastAPI, HTTPException
 import subprocess
 import os
-from typing import Optional
 from diffusers import DiffusionPipeline, DPMSolverMultistepScheduler
 import torch
 
@@ -25,7 +24,8 @@ pid = os.getpid()
 
 
 @app.post("/")
-async def root(prompt: str, video: Optional[bool] = False):
+async def root(request: dict):
+    prompt, video = request['prompt'], request['video']
     if video:
         VideoPipe(
             prompt=prompt,
@@ -47,18 +47,16 @@ async def load():
     try:
         out = subprocess.check_output(
             [
-                "nvidia-smi",
-                "--query-compute-apps=pid,utilization.gpu",
-                "--format=csv,noheader,nounits",
+                "nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader,nounits",
             ],
-            universal_newlines=True,
+            shell=True,
         )
-        lines = out.split("\n")
+        lines = out.decode('utf-8').split('\n')
         for line in lines:
             fields = line.strip().split(",")
             if len(fields) >= 2 and fields[0] == str(pid):
                 gpu_utilization = float(fields[1])
-                gpu_utilization_decimal = gpu_utilization / 100.0
+                gpu_utilization_decimal = gpu_utilization / 40960.0
                 return {
                     "Server": "8082",
                     "GPUload": round(gpu_utilization_decimal, 4)
