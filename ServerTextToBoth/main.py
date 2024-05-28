@@ -1,74 +1,83 @@
-from fastapi import FastAPI, HTTPException
-import subprocess
-import os
+import asyncio
 from diffusers import DiffusionPipeline, DPMSolverMultistepScheduler
+from fastapi import FastAPI
 import torch
+import uvicorn
 
+
+PORT = 8082
 
 VideoPipe = DiffusionPipeline.from_pretrained(
     "damo-vilab/text-to-video-ms-1.7b",
     torch_dtype=torch.float16,
     variant="fp16",
 )
-VideoPipe.to(torch_device="cuda:1", torch_dtype=torch.float32)
+VideoPipe.to(torch_device="cuda:1", torch_dtype=torch.float16)
 VideoPipe.scheduler = DPMSolverMultistepScheduler.from_config(
     VideoPipe.scheduler.config
 )
 VideoPipe.enable_model_cpu_offload()
 
 ImagePipe = DiffusionPipeline.from_pretrained("SimianLuo/LCM_Dreamshaper_v7")
-ImagePipe.to(torch_device="cuda:1", torch_dtype=torch.float32,)
+ImagePipe.to(torch_device="cuda:1", torch_dtype=torch.float16,)
 
 app = FastAPI()
-pid = os.getpid()
+
+NUM_WORKERS = 4
+ACTIVE_WORKERS = 0
+LOCK = asyncio.Lock()
+
+
+async def create_image(prompt: str):
+    await asyncio.to_thread(
+        ImagePipe,
+        prompt=prompt,
+        num_inference_steps=1,
+        guidance_scale=8.0,
+        lcm_origin_steps=25,
+        output_type="pil",
+    )
+
+
+async def create_video(prompt: str):
+    await asyncio.to_thread(
+        VideoPipe,
+        prompt=prompt,
+        num_inference_steps=25,
+    )
 
 
 @app.post("/")
 async def root(request: dict):
+    global ACTIVE_WORKERS
+    ACTIVE_WORKERS += 1
     prompt, video = request['prompt'], request['video']
+
     if video:
-        VideoPipe(
-            prompt=prompt,
-            num_inference_steps=25,
-        )
+        task = create_video(prompt)
     else:
-        ImagePipe(
-            prompt=prompt,
-            num_inference_steps=4,
-            guidance_scale=8.0,
-            lcm_origin_steps=50,
-            output_type="pil",
-        )
+        task = create_image(prompt)
+    try:
+        await asyncio.wait_for(task, timeout=60*3)
+
+    except asyncio.TimeoutError:
+        print("gave up wait, cancel task")
+        ACTIVE_WORKERS -= 1
+        return {"output": "cancelling"}
+    ACTIVE_WORKERS -= 1
     return {"output": "success"}
 
 
 @app.get("/load")
 async def load():
-    try:
-        out = subprocess.check_output(
-            [
-                "nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader,nounits",
-            ],
-            shell=True,
-        )
-        lines = out.decode('utf-8').split('\n')
-        for line in lines:
-            fields = line.strip().split(",")
-            if len(fields) >= 2 and fields[0] == str(pid):
-                gpu_utilization = float(fields[1])
-                gpu_utilization_decimal = gpu_utilization / 40960.0
-                return {
-                    "Server": "8082",
-                    "GPUload": round(gpu_utilization_decimal, 4)
-                    }
-        return {"Server": "8082", "GPUload": 0.00}
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to get GPU load: {str(e)}"
-            )
+    global ACTIVE_WORKERS, NUM_WORKERS
+    utilization = round(ACTIVE_WORKERS/NUM_WORKERS, 4)
+
+    return {
+        "Server": PORT,
+        "GPUload": utilization
+    }
 
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8082)
+    uvicorn.run("main:app", host="0.0.0.0", port=PORT)

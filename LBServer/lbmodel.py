@@ -12,6 +12,7 @@ class RLModel(nn.Module):
     """
     RL модель использущаяся в дипломе.
     """
+
     def __init__(
         self,
         input_size: int,
@@ -41,11 +42,12 @@ class CustomCallback:
         self.model = model
         self.losses = []
         self.rewards = []
-        self.episode = 0
+        self.episodes = 0
 
     def on_episode_end(self):
-        torch.save(self.model.state_dict(), f'model_weights_{episode}.pt')
-        with open('model_data.csv', mode='w') as csv_file:
+        torch.save(self.model.state_dict(
+        ), f'server_eff_125_time_bon_13_reward_25_fine_5_episodes_{self.episodes}.pt')
+        with open(f'server_eff_125_time_bon_13_reward_25_fine_5_episodes_{self.episodes//527}.csv', mode='w') as csv_file:
             self.episode = 0
             fieldnames = ['episode', 'loss', 'reward']
             writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
@@ -98,10 +100,10 @@ def select_action(state, model, device):
 def choose_server(server_data: dict, model: RLModel, device: str):
     processed_data = process_data(server_data)
     action = select_action(
-            processed_data,
-            model,
-            device,
-        )
+        processed_data,
+        model,
+        device,
+    )
     return action
 
 
@@ -128,7 +130,11 @@ def update_model(
                 ).to(device)
             )
         )
-    current_prediction = model(torch.tensor(data, dtype=torch.float32).to(device))
+    current_prediction = model(
+        torch.tensor(
+            data, dtype=torch.float32
+        ).to(device)
+    )
     current_prediction_for_action = current_prediction[latest_action]
 
     # Считаем ошибку
@@ -136,9 +142,11 @@ def update_model(
 
     # отдаем это в коллбэки
     for callback in callbacks:
+        callback.episodes += 1
         callback.on_loss_calculated(loss)
         callback.on_reward_received(reward_value)
-        callback.on_episode_end()
+        if callback.episodes % 527 == 0:
+            callback.on_episode_end()
 
     loss.backward()
     optimizer.step()
