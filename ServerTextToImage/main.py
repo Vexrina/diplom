@@ -13,6 +13,7 @@ app = FastAPI()
 
 NUM_WORKERS = 2
 ACTIVE_WORKERS = 0
+LOCK = asyncio.Lock()
 
 
 async def create_image(prompt: str):

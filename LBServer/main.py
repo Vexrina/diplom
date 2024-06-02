@@ -1,5 +1,4 @@
 import asyncio
-from collections import deque
 from fastapi import FastAPI, HTTPException
 import httpx
 import numpy as np
@@ -9,18 +8,18 @@ import torch.nn as nn
 from torch import optim
 import uvicorn
 import lbmodel
-import minimin
+import minmin
 
 
 miniminFlag = False
 
 time_threshold = 60*3
-time_bonus = 1.5
+time_bonus = 1.3
 
 server_efficiency_bonus = 1.25
 
-fine = -15
-basic_reward = 1.5
+fine = -5
+basic_reward = 2.5
 save_string = f"server_eff_{server_efficiency_bonus}_time_bon_{time_bonus}_reward_{basic_reward}_fine_{fine}"
 
 app = FastAPI()
@@ -46,13 +45,13 @@ model = lbmodel.RLModel(
     output_size=OUT_SIZE,
 ).to(device)
 
-checkpoint = torch.load('model_weights.pt')
-model.load_state_dict(checkpoint['model_state_dict'])
+# checkpoint = torch.load(f'{save_string}_episodes_15.pt')
+# model.load_state_dict(checkpoint['model_state_dict'])
 
 criterion = nn.MSELoss()
 optimizer = optim.Adam(model.parameters(), lr=LR)
 
-optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+# optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
 
 callback = lbmodel.CustomCallback(model, optimizer, save_string)
 
@@ -60,14 +59,14 @@ callbacks = [callback]
 
 
 max_len_queue = 50
-request_queue = deque()
+request_queue = asyncio.Queue()
 request_events = {}
 responses = {}
 
 response_time = np.array([])
 
 
-def get_environment_state(request: dict) -> dict:
+def get_environment_state(request: dict | None) -> dict:
     """Функция-забиратель нагрузки на серверы.
 Ходит по внешним серверам(в рамках ВКР рассматриваются исключительно
 localhost:808(1,2,3), но в теории можно ее масштабировать достаточно просто).
@@ -92,6 +91,9 @@ localhost:808(1,2,3), но в теории можно ее масштабиро�
 
         video              bool
     """
+    global request_queue
+    global request_events
+    global response_time
     server_urls = [
         "http://localhost:8084/load",
         "http://localhost:8082/load",
@@ -108,14 +110,19 @@ localhost:808(1,2,3), но в теории можно ее масштабиро�
             server_loads.append(1.0)
 
     mrt = np.mean(response_time) if response_time.size > 0 else 0
-    request_queue_length = len(request_queue) / max_len_queue
-
+    request_queue_length = request_queue.qsize() / max_len_queue
+    if request:
+        return {
+            "server_loads": server_loads,
+            "queue_len": request_queue_length,
+            "mrt": mrt,
+            "prompt": request["prompt"],
+            "video": request["video"],
+        }
     return {
         "server_loads": server_loads,
         "queue_len": request_queue_length,
         "mrt": mrt,
-        "prompt": request["prompt"],
-        "video": request["video"],
     }
 
 
@@ -137,7 +144,7 @@ def send_reward(
         request,
         server_to_redirect,
         environment['server_loads'],
-        timer,
+        timer
     )
     if max_workers_per_server:
         reward -= fine
@@ -174,7 +181,6 @@ def calculate_reward(
     """
     reward = 0.0
 
-    # не на тот сервер
     if req['video']:
         if server_to_redirect == 2:
             reward -= fine
@@ -186,12 +192,10 @@ def calculate_reward(
         else:
             reward += basic_reward
 
-    # ответ от сервера уже не актуален
     if timer < time_threshold:
         reward += time_bonus
 
-    # эффективное использование серверов
-    reward += max(1-np.mean(server_loads), 0)*server_efficiency_bonus
+    reward += max(1-np.mean(server_loads), 0) * server_efficiency_bonus
 
     return reward
 
@@ -218,7 +222,9 @@ async def main_job(request_body: dict):
     Returns:
         dict: Как только получен ответ, возвращает его пользователю.
     """
-    if len(request_queue) >= max_len_queue:
+    global request_queue
+    global request_events
+    if request_queue.qsize() >= max_len_queue:
         raise HTTPException(
             status_code=500,
             detail="Request queue is full",
@@ -226,12 +232,49 @@ async def main_job(request_body: dict):
 
     event = asyncio.Event()
     request_events[id(request_body)] = event
-    request_queue.append(request_body)
+    await request_queue.put(request_body)
 
     await event.wait()
+    env_state = get_environment_state(None)
     del request_events[id(request_body)]
 
-    return responses[request_body['prompt']].json
+    response_data = responses.get(request_body['prompt'])
+    if response_data is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Response data not found for the given prompt"
+        )
+
+    response = {
+        'result': {
+            'status_code': response_data.status_code,
+            'content': response_data.content.decode(),
+        },
+        "server_loads": env_state["server_loads"],
+        "queue_len": env_state["queue_len"],
+        "mrt": env_state["mrt"],
+    }
+    return response
+
+
+async def choose_server(env, req):
+    if miniminFlag:
+        server_redirect = minmin.min_min_realtime_scheduling(
+            env["server_loads"],
+            req
+        )
+    else:
+        server_redirect = lbmodel.choose_server(env, model, device)
+
+    match server_redirect:
+        case 0:
+            return "8084", server_redirect
+        case 1:
+            return "8082", server_redirect
+        case 2:
+            return "8082", server_redirect
+        case _:
+            return ""
 
 
 async def worker():
@@ -246,97 +289,75 @@ async def worker():
 
 В Golang запускается как горутина
     """
+    global response_time
     server_url = "http://localhost:"
     print("Worker started")
     while True:
-        if request_queue:
-            print("get request")
-            req = request_queue.popleft()
-            event = request_events.get(id(req))
-            start = time.time()
-            env = get_environment_state(req)
-            if miniminFlag:
-                server_redirect = minimin.min_min_realtime_scheduling(
-                    env["server_loads"], req
-                )
-            else:
-                server_redirect = lbmodel.choose_server(env, model, device)
-            print("get redirect server")
-            match server_redirect:
-                case 0:
-                    port = "8084"
-                case 1:
-                    port = "8082"
-                case 2:
-                    port = "8082"
-                case _:
-                    continue
+        req = await request_queue.get()
+        event = request_events.get(id(req))
+        start = time.time()
+        env = get_environment_state(req)
+        print(env)
+        port, server_redirect = choose_server(env, req)
 
-            MaxRequest = requests_per_server[server_redirect] >= MAX_PER_SERVER
-            MaxLoad = env['server_loads'][server_redirect] > 0.8
+        MaxRequest = requests_per_server[server_redirect] >= MAX_PER_SERVER
 
-            if MaxRequest or MaxLoad:
-                err = f"Maximum requests reached for server {server_redirect}"
-                resp = httpx.Response({
-                    "error": err,
-                })
+        if MaxRequest:
+            err = f"Maximum requests reached for server {server_redirect}"
+            resp = httpx.Response({
+                "error": err,
+            })
+            responses[req['prompt']] = resp
+            if event:
+                event.set()
+            end = time.time()-start
+            response_time = np.append(response_time, end)
+            print("send reward")
+            if not miniminFlag:
+                send_reward(req, server_redirect, end+1, True)
+        else:
+            try:
+                requests_per_server[server_redirect] += 1
+                async with httpx.AsyncClient() as client:
+                    resp = await client.post(
+                        url=server_url + port,
+                        json=req,
+                        timeout=time_threshold
+                    )
+                    resp = await client.get('https://google.com')
                 responses[req['prompt']] = resp
                 if event:
                     event.set()
                 end = time.time()-start
-                np.append(response_time, end)
-                print("send reward")
+                response_time = np.append(response_time, end)
+                requests_per_server[server_redirect] -= 1
                 if not miniminFlag:
-                    send_reward(req, server_redirect, end+1, True)
-            else:
-                try:
-                    requests_per_server[server_redirect] += 1
-                    print("wait answer from server:", port)
-                    async with httpx.AsyncClient() as client:
-                        resp = await client.post(
-                            url=server_url + port,
-                            json=req,
-                            timeout=time_threshold
-                        )
-                    responses[req['prompt']] = resp
-                    if event:
-                        event.set()
-                    end = time.time()-start
-                    np.append(response_time, end)
-                    print("send reward")
-                    requests_per_server[server_redirect] -= 1
-                    if not miniminFlag:
-                        send_reward(req, server_redirect, end)
-                except httpx.ReadTimeout as e:
-                    responses[req['prompt']] = httpx.Response(
-                        status_code=500,
-                        content=str(e)
-                    )
-                    if event:
-                        event.set()
-                    end = time.time()-start
-                    np.append(response_time, end)
-                    print("send reward")
-                    requests_per_server[server_redirect] -= 1
-                    if not miniminFlag:
-                        send_reward(req, server_redirect, end+1)
-        else:
-            # print("dont get request")
-            await asyncio.sleep(2)
+                    send_reward(req, server_redirect, end)
+            except httpx.ReadTimeout as e:
+                responses[req['prompt']] = httpx.Response(
+                    status_code=500,
+                    content=str(e)
+                )
+                if event:
+                    event.set()
+                end = time.time()-start
+                response_time = np.append(response_time, end)
+                requests_per_server[server_redirect] -= 1
+                if not miniminFlag:
+                    send_reward(req, server_redirect, end+1)
+        request_queue.task_done()
+        await asyncio.sleep(0.1)
 
 
 async def main():
-    # Запуск сервера uvicorn без использования uvicorn.run()
-    config = uvicorn.Config(app, host="0.0.0.0", port=8080)
+    config = uvicorn.Config(app, host="0.0.0.0", port=8090)
     server = uvicorn.Server(config)
     await server.serve()
 
 
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()
-    tasks = [
-        loop.create_task(main()),
-    ]
-    for _ in range(MAX_WORKERS):
+    tasks = [loop.create_task(main())]
+    for i in range(MAX_WORKERS):
         tasks.append(loop.create_task(worker()))
     loop.run_until_complete(asyncio.gather(*tasks))
